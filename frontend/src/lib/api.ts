@@ -1,4 +1,4 @@
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API = 'http://localhost:8001';
 
 export async function api<T>(
   path: string,
