@@ -1459,7 +1459,10 @@ def evaluate_opportunity_eligibility(
         )
 
         gap = max(required - current, 0)
-        meets = current >= required
+        # Industry matching is based on verified skills, not only assessment scores.
+        # An assessment can establish the current level, but academic verification
+        # is required before the skill counts as a matched requirement.
+        meets = current >= required and verified
         review_status = (
             academic_review_status(db, student_skill)
             if student_skill
@@ -1474,6 +1477,7 @@ def evaluate_opportunity_eligibility(
             "gap": gap,
             "meets": meets,
             "verified": verified,
+            "verification_required": (not verified and current >= required),
             "review_status": review_status,
         })
 
@@ -1487,6 +1491,7 @@ def evaluate_opportunity_eligibility(
                 "required": required,
                 "gap": gap,
                 "verified": verified,
+                "verification_required": (not verified and current >= required),
             })
 
     if not requirements:
@@ -1496,12 +1501,24 @@ def evaluate_opportunity_eligibility(
         eligible = all(item["meets"] for item in comparisons)
 
         if eligible:
-            reasons.append("All required skills meet the configured minimum levels.")
-        else:
             reasons.append(
-                f"{len(missing_skills)} required skill"
-                f"{'' if len(missing_skills) == 1 else 's'} still need to be strengthened."
+                "All required skills meet the configured minimum levels and are academically verified."
             )
+        else:
+            unverified_count = sum(
+                1 for item in comparisons
+                if item["meets"] is False and item["current"] >= item["required"] and not item["verified"]
+            )
+            if unverified_count:
+                reasons.append(
+                    f"{unverified_count} required skill"
+                    f"{'' if unverified_count == 1 else 's'} meet the level but still need academic verification."
+                )
+            if missing_skills:
+                reasons.append(
+                    f"{len(missing_skills)} required skill"
+                    f"{'' if len(missing_skills) == 1 else 's'} do not currently satisfy the verified requirement."
+                )
 
     eligibility = (
         db.query(OpportunityEligibility)
@@ -4235,6 +4252,16 @@ def update_opportunity_eligibility(
 # OPPORTUNITIES
 # ============================================================
 
+def is_company_verified(db: Session, user_id: int) -> bool:
+    """Return True only when the company has an admin-approved verification record."""
+    row = db.execute(
+        company_verification_requests.select().where(
+            company_verification_requests.c.user_id == user_id
+        )
+    ).mappings().first()
+    return bool(row and row["status"] == "Verified")
+
+
 @app.post("/opportunities")
 def create_opportunity(
     data: OpportunityIn,
@@ -4249,6 +4276,12 @@ def create_opportunity(
         raise HTTPException(
             status_code=403,
             detail="Only organizations, academicians or admins can create opportunities",
+        )
+
+    if user.role == "company" and not is_company_verified(db, user.id):
+        raise HTTPException(
+            status_code=403,
+            detail="Company verification is required before posting opportunities",
         )
 
     opportunity = Opportunity(
@@ -4375,8 +4408,8 @@ def opportunity_matches(
             total_ratio = 0.0
             for comparison in eligibility["skill_comparisons"]:
                 required = comparison["required"]
-                current = comparison["current"]
-                total_ratio += min(current / required, 1.0) if required else 1.0
+                current = comparison["current"] if comparison["verified"] else 0
+                total_ratio += min(current / required, 1.0) if required else (1.0 if comparison["verified"] else 0.0)
             score = round(total_ratio / len(opportunity.requirements) * 100)
         else:
             score = 100
@@ -4500,8 +4533,12 @@ def matched_opportunities(
         if requirements:
             total_ratio = sum(
                 (
-                    min(item["current"] / item["required"], 1.0)
-                    if item["required"] else 1.0
+                    min(
+                        (item["current"] if item["verified"] else 0) / item["required"],
+                        1.0,
+                    )
+                    if item["required"]
+                    else (1.0 if item["verified"] else 0.0)
                 )
                 for item in eligibility["skill_comparisons"]
             )
@@ -4558,6 +4595,10 @@ def apply_opportunity(
     )
     if not opportunity:
         raise HTTPException(status_code=404, detail="Opportunity not found")
+    if opportunity.status != "Published":
+        raise HTTPException(status_code=400, detail="This opportunity is not currently open for applications")
+    if opportunity.owner and opportunity.owner.role == "company" and not is_company_verified(db, opportunity.owner_id):
+        raise HTTPException(status_code=403, detail="This company's verification is not active")
 
     eligibility = evaluate_opportunity_eligibility(
         db,

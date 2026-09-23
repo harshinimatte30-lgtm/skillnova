@@ -1,10 +1,99 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
+import type { CSSProperties } from 'react';
 import { api } from '../lib/api';
 import { Card, Stat, Progress, Empty } from '../components/UI';
 import { Profile, Skill, RoleOption } from '../types';
 import './assessment-ui.css';
 
 type EvidenceType = 'project' | 'certificate' | 'course';
+
+// ============================================================
+// AYUSH CAREER PROFILE TAXONOMY
+// Source-aligned domain structure for SkillNova's AYUSH-only flow.
+// These are preference categories, not claims about licensing or eligibility.
+// ============================================================
+const AYUSH_SYSTEMS = [
+  'Ayurveda',
+  'Yoga & Naturopathy',
+  'Unani',
+  'Siddha',
+  'Sowa-Rigpa',
+  'Homoeopathy',
+] as const;
+
+const AYUSH_CAREER_DIRECTIONS = [
+  'AYUSH Research & Evidence',
+  'Clinical / Healthcare Services',
+  'AYUSH Pharmaceutical & Product Development',
+  'Quality Control / Quality Assurance',
+  'Drug Standardization',
+  'Pharmacovigilance / Drug Safety',
+  'Medicinal Plants / Herbal Products',
+  'AYUSH Education / Academia',
+  'Public Health / Community AYUSH',
+  'Regulatory / Compliance',
+  'AYUSH Digital Health / Informatics',
+  'Industry / Innovation',
+  'Entrepreneurship',
+] as const;
+
+const AYUSH_WORK_PREFERENCES = [
+  'Research-oriented',
+  'Laboratory / Analytical',
+  'Clinical / Patient-facing',
+  'Field / Community work',
+  'Product Development',
+  'Quality / Standardization',
+  'Data / Computational',
+  'Teaching / Scientific Communication',
+  'Industry / Corporate',
+  'Policy / Regulatory',
+] as const;
+
+type AyushProfilePreferences = {
+  version: 1;
+  ayush_systems: string[];
+  career_directions: string[];
+  work_preferences: string[];
+  additional_interests: string;
+};
+
+function parseAyushProfile(value: string | undefined): AyushProfilePreferences {
+  const fallback: AyushProfilePreferences = {
+    version: 1,
+    ayush_systems: [],
+    career_directions: [],
+    work_preferences: [],
+    additional_interests: '',
+  };
+
+  if (!value) return fallback;
+
+  try {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === 'object' && parsed.version === 1) {
+      return {
+        ...fallback,
+        ...parsed,
+        ayush_systems: Array.isArray(parsed.ayush_systems) ? parsed.ayush_systems : [],
+        career_directions: Array.isArray(parsed.career_directions) ? parsed.career_directions : [],
+        work_preferences: Array.isArray(parsed.work_preferences) ? parsed.work_preferences : [],
+        additional_interests: typeof parsed.additional_interests === 'string' ? parsed.additional_interests : '',
+      };
+    }
+  } catch {
+    // Existing SkillNova profiles may contain plain text. Preserve it below.
+  }
+
+  return { ...fallback, additional_interests: value };
+}
+
+const preferenceGrid: CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(190px, 1fr))',
+  gap: 10,
+};
+
 
 type StudentSkill = {
   id: number;
@@ -238,6 +327,7 @@ type AssessmentQuestion = {
   id: number;
   skill_id?: number | null;
   category: string;
+  topic?: string | null;
   question: string;
   options: { A: string; B: string; C: string; D: string };
   order: number;
@@ -250,12 +340,22 @@ type AssessmentStartResponse = {
   role_id: number;
   test_type?: string;
   difficulty?: string;
+  topic?: string | null;
   year?: string;
   title?: string;
   description?: string;
   total_questions?: number;
   questions?: AssessmentQuestion[];
   message?: string;
+};
+
+
+type AssessmentTopic = {
+  name: string;
+  description: string;
+  recommended: boolean;
+  available_questions: number;
+  ready: boolean;
 };
 
 type AssessmentResult = {
@@ -617,8 +717,16 @@ const [assessmentError, setAssessmentError] =
 
   const [assessmentType, setAssessmentType] = useState<'Role-specific' | 'Aptitude' | 'Soft Skills'>('Role-specific');
   const [assessmentDifficulty, setAssessmentDifficulty] = useState<'Easy' | 'Medium' | 'Hard'>('Medium');
+  const [assessmentTopics, setAssessmentTopics] = useState<AssessmentTopic[]>([]);
+  const [assessmentTopic, setAssessmentTopic] = useState('');
   const [assessmentYear, setAssessmentYear] = useState('2nd Year');
   const [assessmentQuestionIndex, setAssessmentQuestionIndex] = useState(0);
+
+  const [ayushSystems, setAyushSystems] = useState<string[]>([]);
+  const [careerDirections, setCareerDirections] = useState<string[]>([]);
+  const [workPreferences, setWorkPreferences] = useState<string[]>([]);
+  const [additionalInterests, setAdditionalInterests] = useState('');
+  const [ayushProfileOpen, setAyushProfileOpen] = useState(true);
 
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -680,6 +788,23 @@ const [assessmentError, setAssessmentError] =
       ]);
 
       setProfile(p);
+      if (p.target_role_id) {
+        try {
+          const topicData = await api<{ topics: AssessmentTopic[] }>(`/student/assessment/${p.target_role_id}/topics`);
+          const topics = Array.isArray(topicData?.topics) ? topicData.topics : [];
+          setAssessmentTopics(topics);
+          const firstReady = topics.find((item) => item.ready);
+          setAssessmentTopic((current) => current || firstReady?.name || topics[0]?.name || '');
+        } catch {
+          setAssessmentTopics([]);
+          setAssessmentTopic('');
+        }
+      }
+      const ayushPrefs = parseAyushProfile(p.career_interests);
+      setAyushSystems(ayushPrefs.ayush_systems);
+      setCareerDirections(ayushPrefs.career_directions);
+      setWorkPreferences(ayushPrefs.work_preferences);
+      setAdditionalInterests(ayushPrefs.additional_interests);
       if (p.year_degree) setAssessmentYear(p.year_degree);
       setSkills(s);
       setRoles(r);
@@ -718,6 +843,7 @@ const [assessmentError, setAssessmentError] =
       const params = new URLSearchParams({
         test_type: assessmentType,
         difficulty: assessmentDifficulty,
+        topic: assessmentType === 'Role-specific' ? assessmentTopic : '',
         year: profile.year_degree || ''
       });
       const data = await api<AssessmentStartResponse>(`/student/assessment/${profile.target_role_id}/start?${params.toString()}`, { method: 'POST' });
@@ -862,9 +988,14 @@ const [assessmentError, setAssessmentError] =
           target_role_id:
             Number(f.get('target_role_id')) || null,
 
-          career_interests:
-            f.get('career_interests'),
-            research_experience:
+          career_interests: JSON.stringify({
+            version: 1,
+            ayush_systems: ayushSystems,
+            career_directions: careerDirections,
+            work_preferences: workPreferences,
+            additional_interests: additionalInterests.trim(),
+          }),
+          research_experience:
             profile?.research_experience || '',
             achievements:
             profile?.achievements || '',
@@ -1353,17 +1484,157 @@ const [assessmentError, setAssessmentError] =
             </select>
           </label>
 
-          <label className="full">
-            Career interests
+          <div
+            className="full"
+            style={{
+              border: '1px solid rgba(15,23,42,0.10)',
+              borderRadius: 18,
+              padding: 18,
+              background: 'rgba(15,23,42,0.018)',
+            }}
+          >
+            <button
+              type="button"
+              onClick={() => setAyushProfileOpen((open) => !open)}
+              style={{
+                width: '100%',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+                border: 0,
+                background: 'transparent',
+                padding: 0,
+                cursor: 'pointer',
+                color: 'inherit',
+                textAlign: 'left',
+              }}
+            >
+              <span>
+                <strong style={{ display: 'block', fontSize: 17 }}>🌿 AYUSH Career Profile</strong>
+                <span className="muted" style={{ display: 'block', marginTop: 4, fontSize: 12 }}>
+                  Tell SkillNova what part of the AYUSH ecosystem you want to explore.
+                </span>
+              </span>
+              <span aria-hidden="true" style={{ fontSize: 18 }}>{ayushProfileOpen ? '⌃' : '⌄'}</span>
+            </button>
 
-            <textarea
-              name="career_interests"
-              defaultValue={
-                profile.career_interests
-              }
-              placeholder="e.g. herbal formulation, pharmacognosy, research…"
-            />
-          </label>
+            {ayushProfileOpen && (
+              <div style={{ display: 'grid', gap: 20, marginTop: 18 }}>
+                <div>
+                  <div style={{ fontWeight: 800, marginBottom: 5 }}>AYUSH systems / domains of interest</div>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 11 }}>Select all that genuinely interest you.</div>
+                  <div style={preferenceGrid}>
+                    {AYUSH_SYSTEMS.map((item) => {
+                      const checked = ayushSystems.includes(item);
+                      return (
+                        <label
+                          key={item}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 9,
+                            padding: '11px 12px',
+                            borderRadius: 12,
+                            border: checked ? '1px solid currentColor' : '1px solid rgba(15,23,42,0.10)',
+                            background: checked ? 'rgba(15,23,42,0.06)' : 'transparent',
+                            cursor: 'pointer',
+                            fontSize: 13,
+                            fontWeight: checked ? 750 : 600,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => setAyushSystems((current) => checked ? current.filter((x) => x !== item) : [...current, item])}
+                          />
+                          {item}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <div style={{ fontWeight: 800, marginBottom: 5 }}>AYUSH career directions</div>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 11 }}>Choose the areas of work you would like SkillNova to consider when matching you.</div>
+                  <div style={preferenceGrid}>
+                    {AYUSH_CAREER_DIRECTIONS.map((item) => {
+                      const checked = careerDirections.includes(item);
+                      return (
+                        <label
+                          key={item}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 9,
+                            padding: '11px 12px',
+                            borderRadius: 12,
+                            border: checked ? '1px solid currentColor' : '1px solid rgba(15,23,42,0.10)',
+                            background: checked ? 'rgba(15,23,42,0.06)' : 'transparent',
+                            cursor: 'pointer',
+                            fontSize: 13,
+                            fontWeight: checked ? 750 : 600,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => setCareerDirections((current) => checked ? current.filter((x) => x !== item) : [...current, item])}
+                          />
+                          {item}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <div style={{ fontWeight: 800, marginBottom: 5 }}>Preferred work style</div>
+                  <div className="muted" style={{ fontSize: 12, marginBottom: 11 }}>These preferences will later influence career and opportunity matching.</div>
+                  <div style={preferenceGrid}>
+                    {AYUSH_WORK_PREFERENCES.map((item) => {
+                      const checked = workPreferences.includes(item);
+                      return (
+                        <label
+                          key={item}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 9,
+                            padding: '11px 12px',
+                            borderRadius: 12,
+                            border: checked ? '1px solid currentColor' : '1px solid rgba(15,23,42,0.10)',
+                            background: checked ? 'rgba(15,23,42,0.06)' : 'transparent',
+                            cursor: 'pointer',
+                            fontSize: 13,
+                            fontWeight: checked ? 750 : 600,
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => setWorkPreferences((current) => checked ? current.filter((x) => x !== item) : [...current, item])}
+                          />
+                          {item}
+                        </label>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <label>
+                  <span>Anything else you want SkillNova to know</span>
+                  <textarea
+                    value={additionalInterests}
+                    onChange={(e) => setAdditionalInterests(e.target.value)}
+                    placeholder="For example: interest in medicinal plants, evidence-based AYUSH research, traditional knowledge documentation…"
+                    rows={3}
+                  />
+                </label>
+              </div>
+            )}
+          </div>
 
           <button
             className="primary"
@@ -2027,6 +2298,19 @@ const [assessmentError, setAssessmentError] =
                   <option>Hard</option>
                 </select>
               </label>
+              {assessmentType === 'Role-specific' && (
+                <label>
+                  <span>AYUSH competency topic</span>
+                  <select value={assessmentTopic} onChange={e => setAssessmentTopic(e.target.value)}>
+                    <option value="">Select a topic</option>
+                    {assessmentTopics.map((topic) => (
+                      <option key={topic.name} value={topic.name} disabled={!topic.ready}>
+                        {topic.name}{topic.ready ? '' : ' — bank needs expansion'}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
             </div>
           </Card>
 
@@ -2060,10 +2344,10 @@ const [assessmentError, setAssessmentError] =
           <Card className="assessment-launch-card">
             <div>
               <div className="eyebrow">Ready to begin?</div>
-              <h3>{assessmentType} · {assessmentDifficulty}</h3>
-              <p className="muted">Questions will be calibrated for a {assessmentYear} student and your target role.</p>
+              <h3>{assessmentType} · {assessmentDifficulty}{assessmentType === 'Role-specific' && assessmentTopic ? ` · ${assessmentTopic}` : ''}</h3>
+              <p className="muted">{assessmentType === 'Role-specific' ? '10 unique AYUSH competency questions will be selected from your role/profile-relevant topic.' : 'Questions will be calibrated for your academic year and selected test type.'}</p>
             </div>
-            <button className="primary launch-button" onClick={startAssessment}>Take quiz →</button>
+            <button className="primary launch-button" onClick={startAssessment} disabled={assessmentType === 'Role-specific' && !assessmentTopic}>Take quiz →</button>
           </Card>
         </div>
       );
@@ -2095,7 +2379,7 @@ const [assessmentError, setAssessmentError] =
 
           <div className="quiz-card">
             <div className="quiz-meta">
-              <span className="assessment-pill blue">{currentAssessmentQuestion.category}</span>
+              <span className="assessment-pill blue">{currentAssessmentQuestion.topic || currentAssessmentQuestion.category}</span>
               <span className="assessment-pill purple">{assessmentDifficulty}</span>
               <span className="muted">Question {assessmentQuestionIndex + 1}</span>
             </div>
@@ -2889,31 +3173,41 @@ const [assessmentError, setAssessmentError] =
   );
 
   const renderCareerPaths = () => {
-    const strongSkills = selectedCareerRoadmap.filter(
-      (item) => item.status === 'Already strong'
-    );
-    const learningSteps = selectedCareerRoadmap.filter(
-      (item) => item.status !== 'Already strong'
-    );
+    const selected = selectedCareerPath;
+    const roadmap = selected?.roadmap || [];
+    const strongSkills = roadmap.filter((item) => item.status === 'Already strong');
+    const learningSteps = roadmap.filter((item) => item.status !== 'Already strong');
+
+    const clamp = (value: number) => Math.max(0, Math.min(100, value || 0));
+    const readiness = clamp(selected?.readiness || 0);
+    const targetRoleId = profile?.target_role_id;
 
     return (
       <div className="stack">
         {error && <div className="error">{error}</div>}
 
-        <div className="hero">
-          <div>
-            <div className="eyebrow">YOUR PERSONALIZED AYUSH ROADMAP</div>
-            <h2>Roles you can build toward — one skill at a time.</h2>
-            <p>
-              SkillNova compares your current evidence-backed skills with the
-              AYUSH role framework, then turns the gaps into a step-by-step
-              learning path that changes as your profile changes.
-            </p>
+        {/* Compact roadmap header */}
+        <Card>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'minmax(0, 1fr) auto',
+              gap: 22,
+              alignItems: 'center',
+            }}
+          >
+            <div>
+              <div className="eyebrow">PERSONALIZED AYUSH ROADMAP</div>
+              <h2 style={{ margin: '6px 0 8px' }}>Your career path at a glance</h2>
+              <p className="muted" style={{ margin: 0, maxWidth: 720 }}>
+                Choose a role to see your current alignment, strongest skills and the next steps to build.
+              </p>
+            </div>
+            <button className="primary" onClick={() => setPage('My Skills')}>
+              Update skills
+            </button>
           </div>
-          <button className="primary" onClick={() => setPage('My Skills')}>
-            Update my skills
-          </button>
-        </div>
+        </Card>
 
         {!careerPaths.length ? (
           <Card>
@@ -2924,268 +3218,415 @@ const [assessmentError, setAssessmentError] =
           </Card>
         ) : (
           <>
+            {/* Role selector: compact cards instead of large text blocks */}
             <Card>
-              <div className="section-title">
-                Roles that match your current skill profile
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: 12,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <div>
+                  <div className="section-title">Choose a career path</div>
+                  <div className="muted" style={{ fontSize: 13, marginTop: 3 }}>
+                    Alignment is calculated from your current evidence-backed skills.
+                  </div>
+                </div>
+                <span className="chip">{careerPaths.length} paths</span>
               </div>
-              <p className="muted" style={{ marginTop: 0 }}>
-                These are learning-path matches, not hiring eligibility
-                decisions. The recommendations update when your skills or
-                evidence change.
-              </p>
 
               <div
                 style={{
                   display: 'grid',
-                  gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))',
-                  gap: 14,
-                  marginTop: 18,
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))',
+                  gap: 10,
+                  marginTop: 16,
                 }}
               >
                 {careerPaths.slice(0, 8).map((path) => {
-                  const selected = path.role_id === selectedCareerRoleId;
-                  const target = path.role_id === profile?.target_role_id;
+                  const isSelected = path.role_id === selectedCareerRoleId;
+                  const isTarget = path.role_id === targetRoleId;
+                  const value = clamp(path.readiness);
 
                   return (
                     <button
                       key={path.role_id}
                       type="button"
                       onClick={() => setSelectedCareerRoleId(path.role_id)}
+                      aria-pressed={isSelected}
                       style={{
                         textAlign: 'left',
-                        border: selected
+                        border: isSelected
                           ? '2px solid currentColor'
-                          : '1px solid rgba(15,23,42,0.12)',
-                        borderRadius: 16,
-                        background: selected ? 'rgba(15,23,42,0.035)' : 'white',
-                        padding: 18,
+                          : '1px solid rgba(15,23,42,0.10)',
+                        borderRadius: 14,
+                        background: isSelected ? 'rgba(15,23,42,0.035)' : 'white',
+                        padding: 13,
                         cursor: 'pointer',
                         color: 'inherit',
+                        minHeight: 92,
                       }}
                     >
-                      <div
-                        style={{
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          gap: 12,
-                          alignItems: 'flex-start',
-                        }}
-                      >
-                        <div>
-                          <strong style={{ fontSize: 16 }}>{path.role_name}</strong>
-                          {target && (
-                            <span
-                              style={{
-                                display: 'inline-block',
-                                marginLeft: 8,
-                                fontSize: 11,
-                                fontWeight: 700,
-                                padding: '4px 7px',
-                                borderRadius: 999,
-                                background: 'rgba(15,23,42,0.08)',
-                              }}
-                            >
-                              Your target
-                            </span>
-                          )}
-                        </div>
-                        <strong style={{ fontSize: 18 }}>{path.readiness}%</strong>
-                      </div>
-
-                      <div
-                        style={{
-                          height: 7,
-                          borderRadius: 999,
-                          background: 'rgba(15,23,42,0.10)',
-                          marginTop: 14,
-                          overflow: 'hidden',
-                        }}
-                      >
+                      <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
                         <div
                           style={{
-                            width: `${Math.max(0, Math.min(100, path.readiness))}%`,
-                            height: '100%',
-                            borderRadius: 999,
-                            background: 'currentColor',
+                            width: 50,
+                            height: 50,
+                            flex: '0 0 50px',
+                            borderRadius: '50%',
+                            display: 'grid',
+                            placeItems: 'center',
+                            fontWeight: 800,
+                            fontSize: 13,
+                            background: `conic-gradient(currentColor ${value * 3.6}deg, rgba(15,23,42,0.08) 0deg)`,
+                            position: 'relative',
                           }}
-                        />
-                      </div>
-
-                      <p className="muted" style={{ margin: '12px 0 0' }}>
-                        {path.core_matched} of {path.core_total} core skills met
-                        {path.next_skill
-                          ? ` · Next: ${path.next_skill}`
-                          : ' · Core foundation is complete'}
-                      </p>
-
-                      {path.matched_skills.length > 0 && (
-                        <div style={{ marginTop: 12, fontSize: 12 }}>
-                          <span className="muted">You already bring: </span>
-                          {path.matched_skills.slice(0, 3).join(' · ')}
+                        >
+                          <span
+                            style={{
+                              width: 38,
+                              height: 38,
+                              borderRadius: '50%',
+                              display: 'grid',
+                              placeItems: 'center',
+                              background: 'white',
+                            }}
+                          >
+                            {value}%
+                          </span>
                         </div>
-                      )}
+
+                        <div style={{ minWidth: 0, flex: 1 }}>
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'flex-start',
+                              justifyContent: 'space-between',
+                              gap: 8,
+                            }}
+                          >
+                            <strong style={{ fontSize: 14, lineHeight: 1.25 }}>
+                              {path.role_name}
+                            </strong>
+                            {isTarget && <span className="chip">Target</span>}
+                          </div>
+                          <div className="muted" style={{ fontSize: 11, marginTop: 7 }}>
+                            {path.core_matched}/{path.core_total} core skills met
+                            {path.next_skill ? ` · Next: ${path.next_skill}` : ' · Foundation complete'}
+                          </div>
+                        </div>
+                      </div>
                     </button>
                   );
                 })}
               </div>
+
+              <div className="muted" style={{ fontSize: 11, marginTop: 10 }}>
+                These are learning-path matches, not hiring eligibility decisions.
+              </div>
             </Card>
 
-            {selectedCareerPath && (
+            {selected && (
               <>
+                {/* Selected role dashboard */}
                 <Card>
                   <div
                     style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      alignItems: 'flex-start',
-                      gap: 18,
-                      flexWrap: 'wrap',
+                      display: 'grid',
+                      gridTemplateColumns: 'auto minmax(0, 1fr)',
+                      gap: 22,
+                      alignItems: 'center',
                     }}
                   >
-                    <div style={{ maxWidth: 760 }}>
-                      <div className="eyebrow">SELECTED CAREER PATH</div>
-                      <div className="section-title" style={{ fontSize: 25 }}>
-                        {selectedCareerPath.role_name}
-                      </div>
-                      <p className="muted" style={{ marginTop: 6 }}>
-                        {selectedCareerPath.description ||
-                          'A personalized AYUSH role pathway based on your current skills.'}
-                      </p>
-                    </div>
-
                     <div
                       style={{
-                        minWidth: 150,
-                        textAlign: 'center',
-                        padding: 14,
-                        borderRadius: 14,
-                        background: 'rgba(15,23,42,0.04)',
+                        width: 150,
+                        height: 150,
+                        borderRadius: '50%',
+                        display: 'grid',
+                        placeItems: 'center',
+                        background: `conic-gradient(currentColor ${readiness * 3.6}deg, rgba(15,23,42,0.08) 0deg)`,
+                        position: 'relative',
                       }}
                     >
-                      <div className="muted" style={{ fontSize: 12 }}>
-                        Current alignment
+                      <div
+                        style={{
+                          width: 120,
+                          height: 120,
+                          borderRadius: '50%',
+                          background: 'white',
+                          display: 'grid',
+                          placeItems: 'center',
+                          textAlign: 'center',
+                        }}
+                      >
+                        <div>
+                          <strong style={{ display: 'block', fontSize: 32 }}>{readiness}%</strong>
+                          <span className="muted" style={{ fontSize: 11 }}>current alignment</span>
+                        </div>
                       </div>
-                      <strong style={{ fontSize: 30 }}>
-                        {selectedCareerPath.readiness}%
-                      </strong>
                     </div>
-                  </div>
 
-                  <div
-                    style={{
-                      display: 'grid',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
-                      gap: 10,
-                      marginTop: 18,
-                    }}
-                  >
-                    <div className="gap-mini">
-                      <div>
-                        <strong>{selectedCareerPath.core_matched}</strong>
-                        <div className="muted">Core skills met</div>
-                      </div>
-                    </div>
-                    <div className="gap-mini">
-                      <div>
-                        <strong>{selectedCareerPath.core_partial}</strong>
-                        <div className="muted">Core skills to strengthen</div>
-                      </div>
-                    </div>
-                    <div className="gap-mini">
-                      <div>
-                        <strong>{selectedCareerPath.core_missing}</strong>
-                        <div className="muted">Core skills to start</div>
+                    <div style={{ minWidth: 0 }}>
+                      <div className="eyebrow">SELECTED CAREER PATH</div>
+                      <h2 style={{ margin: '5px 0 7px' }}>{selected.role_name}</h2>
+                      <p className="muted" style={{ margin: 0, lineHeight: 1.5 }}>
+                        {selected.description || 'A personalized AYUSH role pathway based on your current skills.'}
+                      </p>
+
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
+                          gap: 9,
+                          marginTop: 16,
+                        }}
+                      >
+                        <div className="gap-mini">
+                          <strong>{selected.core_matched}</strong>
+                          <span className="muted">Core met</span>
+                        </div>
+                        <div className="gap-mini">
+                          <strong>{selected.core_partial}</strong>
+                          <span className="muted">To strengthen</span>
+                        </div>
+                        <div className="gap-mini">
+                          <strong>{selected.core_missing}</strong>
+                          <span className="muted">To start</span>
+                        </div>
                       </div>
                     </div>
                   </div>
                 </Card>
 
-                {strongSkills.length > 0 && (
-                  <Card>
-                    <div className="section-title">Your starting foundation</div>
-                    <p className="muted" style={{ marginTop: 0 }}>
-                      These skills already meet this role's current core
-                      requirement. Use them as the foundation for the next steps.
-                    </p>
-                    <div
-                      style={{
-                        display: 'grid',
-                        gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
-                        gap: 10,
-                        marginTop: 14,
-                      }}
-                    >
-                      {strongSkills.map((item) => (
-                        <div className="gap-mini" key={`strong-${item.skill_id}`}>
-                          <div>
-                            <strong>{item.skill}</strong>
-                            <div className="muted">
-                              {item.current}% current · {item.required}% required
-                            </div>
-                          </div>
-                          <span>✓</span>
-                        </div>
-                      ))}
-                    </div>
-                  </Card>
-                )}
+                {/* Visual journey tracker */}
+                {(() => {
+                  const verifiedCount = roadmap.filter((item) => item.verified).length;
+                  const completedInternship = internships.some((item) => item.status === 'Completed');
+                  const hasProject = Boolean(portfolio?.projects?.length);
+                  const hasOpportunity = opps.some((item) => item.eligible !== false);
+                  const nextSkill = selected.next_skill;
+                  const learningComplete = !nextSkill || selected.next_skill_gap <= 0;
 
+                  const stages = [
+                    {
+                      title: 'Profile',
+                      done: profile?.target_role_id === selected.role_id,
+                      label: profile?.target_role_id === selected.role_id ? 'Target selected' : 'Set target',
+                      page: 'My Profile',
+                    },
+                    {
+                      title: 'Skills',
+                      done: strongSkills.length > 0 || learningComplete,
+                      label: learningComplete ? 'Core skills ready' : nextSkill ? `Build ${nextSkill}` : 'Build skills',
+                      page: 'My Skills',
+                    },
+                    {
+                      title: 'Project',
+                      done: hasProject,
+                      label: hasProject ? 'Evidence added' : 'Add evidence',
+                      page: 'Portfolio',
+                    },
+                    {
+                      title: 'Assessment',
+                      done: Boolean(assessmentResult),
+                      label: assessmentResult ? 'Completed' : 'Take assessment',
+                      page: 'Assessment',
+                    },
+                    {
+                      title: 'Verified',
+                      done: verifiedCount > 0,
+                      label: verifiedCount > 0 ? `${verifiedCount} verified` : 'Request verification',
+                      page: 'My Skills',
+                    },
+                    {
+                      title: 'Experience',
+                      done: completedInternship,
+                      label: completedInternship ? 'Internship completed' : 'Explore internships',
+                      page: 'Internships',
+                    },
+                    {
+                      title: 'Opportunity',
+                      done: hasOpportunity,
+                      label: hasOpportunity ? 'Matches available' : 'Explore matches',
+                      page: 'Opportunities',
+                    },
+                  ];
+
+                  const completedCount = stages.filter((stage) => stage.done).length;
+                  const currentStageIndex = stages.findIndex((stage) => !stage.done);
+
+                  return (
+                    <Card>
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          gap: 12,
+                          flexWrap: 'wrap',
+                        }}
+                      >
+                        <div>
+                          <div className="section-title">Your progress tracker</div>
+                          <div className="muted" style={{ fontSize: 13 }}>
+                            Follow your journey from profile setup to opportunities.
+                          </div>
+                        </div>
+                        <span className="chip">
+                          {completedCount}/{stages.length} complete
+                        </span>
+                      </div>
+
+                      <div
+                        style={{
+                          display: 'grid',
+                          gridTemplateColumns: 'repeat(7, minmax(100px, 1fr))',
+                          gap: 0,
+                          marginTop: 24,
+                          overflowX: 'auto',
+                          paddingBottom: 6,
+                        }}
+                      >
+                        {stages.map((stage, index) => {
+                          const isCurrent = index === currentStageIndex;
+                          const circleBackground = stage.done ? '#0f172a' : '#ffffff';
+                          const circleColor = stage.done ? '#ffffff' : '#0f172a';
+                          const circleBorder = '#0f172a';
+
+                          return (
+                            <button
+                              key={stage.title}
+                              type="button"
+                              onClick={() => setPage(stage.page)}
+                              style={{
+                                border: 0,
+                                background: 'transparent',
+                                color: '#0f172a',
+                                cursor: 'pointer',
+                                minWidth: 100,
+                                padding: '0 5px',
+                              }}
+                            >
+                              <div style={{ position: 'relative' }}>
+                                {index < stages.length - 1 && (
+                                  <div
+                                    style={{
+                                      position: 'absolute',
+                                      top: 16,
+                                      left: '50%',
+                                      width: '100%',
+                                      height: 3,
+                                      borderRadius: 999,
+                                      background: stage.done ? '#0f172a' : 'rgba(15,23,42,0.12)',
+                                      zIndex: 0,
+                                    }}
+                                  />
+                                )}
+
+                                <div
+                                  style={{
+                                    position: 'relative',
+                                    zIndex: 1,
+                                    width: 36,
+                                    height: 36,
+                                    margin: '0 auto',
+                                    borderRadius: '50%',
+                                    display: 'grid',
+                                    placeItems: 'center',
+                                    fontWeight: 800,
+                                    fontSize: 13,
+                                    lineHeight: 1,
+                                    background: circleBackground,
+                                    color: circleColor,
+                                    border: `2px solid ${circleBorder}`,
+                                    boxShadow: stage.done
+                                      ? '0 0 0 4px rgba(15,23,42,0.08)'
+                                      : isCurrent
+                                        ? '0 0 0 4px rgba(15,23,42,0.08)'
+                                        : 'none',
+                                  }}
+                                >
+                                  <span style={{ display: 'block', color: circleColor }}>
+                                    {index + 1}
+                                  </span>
+                                </div>
+                              </div>
+
+                              <strong
+                                style={{
+                                  display: 'block',
+                                  fontSize: 12,
+                                  marginTop: 9,
+                                  fontWeight: 800,
+                                }}
+                              >
+                                {stage.title}
+                              </strong>
+
+                              <span
+                                className="muted"
+                                style={{
+                                  display: 'block',
+                                  fontSize: 10,
+                                  marginTop: 3,
+                                  lineHeight: 1.3,
+                                  minHeight: 26,
+                                }}
+                              >
+                                {stage.label}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </Card>
+                  );
+                })()}
+
+                {/* Skill gap visual */}
                 <Card>
-                  <div className="section-title">Your skill-by-skill roadmap</div>
-                  <p className="muted" style={{ marginTop: 0 }}>
-                    Follow the steps in order. When a skill reaches the required
-                    level, the next step becomes your focus. There is no fixed
-                    timeline — your roadmap moves when your skill profile moves.
-                  </p>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: 12,
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <div>
+                      <div className="section-title">Skill gap at a glance</div>
+                      <div className="muted" style={{ fontSize: 13, marginTop: 3 }}>
+                        Current level compared with the requirement for {selected.role_name}.
+                      </div>
+                    </div>
+                    {selected.next_skill && (
+                      <span className="chip">Next: {selected.next_skill}</span>
+                    )}
+                  </div>
 
                   {learningSteps.length ? (
-                    <div style={{ marginTop: 20 }}>
-                      {learningSteps.map((item, index) => (
-                        <div
-                          key={`${selectedCareerPath.role_id}-${item.skill_id}-${item.category}`}
-                          style={{
-                            display: 'grid',
-                            gridTemplateColumns: '44px minmax(0, 1fr)',
-                            gap: 14,
-                            position: 'relative',
-                            paddingBottom: index === learningSteps.length - 1 ? 0 : 22,
-                          }}
-                        >
-                          {index < learningSteps.length - 1 && (
-                            <div
-                              style={{
-                                position: 'absolute',
-                                left: 21,
-                                top: 42,
-                                bottom: 0,
-                                width: 2,
-                                background: 'rgba(15,23,42,0.10)',
-                              }}
-                            />
-                          )}
+                    <div style={{ display: 'grid', gap: 11, marginTop: 18 }}>
+                      {learningSteps.slice(0, 8).map((item, index) => {
+                        const current = clamp(item.current);
+                        const required = clamp(item.required);
+                        const ratio = required > 0 ? Math.min(current / required, 1) * 100 : 100;
+                        const isNext = selected.next_skill === item.skill;
 
+                        return (
                           <div
+                            key={`${selected.role_id}-${item.skill_id}-${item.category}`}
                             style={{
-                              width: 42,
-                              height: 42,
-                              borderRadius: '50%',
-                              display: 'grid',
-                              placeItems: 'center',
-                              fontWeight: 800,
-                              background: 'rgba(15,23,42,0.07)',
-                              position: 'relative',
-                              zIndex: 1,
-                            }}
-                          >
-                            {index + 1}
-                          </div>
-
-                          <div
-                            style={{
-                              border: '1px solid rgba(15,23,42,0.10)',
-                              borderRadius: 14,
-                              padding: 16,
-                              background: 'white',
+                              padding: 13,
+                              borderRadius: 13,
+                              border: isNext
+                                ? '2px solid currentColor'
+                                : '1px solid rgba(15,23,42,0.09)',
+                              background: isNext ? 'rgba(15,23,42,0.025)' : 'white',
                             }}
                           >
                             <div
@@ -3193,75 +3634,121 @@ const [assessmentError, setAssessmentError] =
                                 display: 'flex',
                                 justifyContent: 'space-between',
                                 gap: 12,
-                                alignItems: 'flex-start',
-                                flexWrap: 'wrap',
+                                alignItems: 'center',
                               }}
                             >
-                              <div>
-                                <div
-                                  style={{
-                                    fontSize: 11,
-                                    fontWeight: 800,
-                                    letterSpacing: '.06em',
-                                    textTransform: 'uppercase',
-                                    opacity: 0.65,
-                                  }}
-                                >
-                                  {item.status}
-                                </div>
-                                <strong style={{ fontSize: 18 }}>{item.skill}</strong>
+                              <div style={{ minWidth: 0 }}>
+                                <span className="muted" style={{ fontSize: 10, fontWeight: 800 }}>
+                                  STEP {index + 1}
+                                </span>
+                                <strong style={{ display: 'block', fontSize: 14, marginTop: 2 }}>
+                                  {item.skill}
+                                </strong>
                               </div>
-                              <span
-                                style={{
-                                  padding: '6px 9px',
-                                  borderRadius: 999,
-                                  fontSize: 12,
-                                  fontWeight: 700,
-                                  background: 'rgba(15,23,42,0.06)',
-                                }}
-                              >
-                                {item.current}% → {item.required}%
+                              <span style={{ fontSize: 12, fontWeight: 800, whiteSpace: 'nowrap' }}>
+                                {item.current}% / {item.required}%
                               </span>
                             </div>
 
-                            <p style={{ margin: '10px 0 5px' }}>{item.action}</p>
-                            <div className="muted" style={{ fontSize: 13 }}>
-                              {item.reason}
-                              {item.verified && ' · Academically verified'}
+                            <div
+                              style={{
+                                height: 8,
+                                marginTop: 9,
+                                borderRadius: 999,
+                                background: 'rgba(15,23,42,0.08)',
+                                overflow: 'hidden',
+                                position: 'relative',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: `${required}%`,
+                                  background: 'currentColor',
+                                  opacity: 0.20,
+                                  borderRadius: 999,
+                                }}
+                              />
+                              <div
+                                style={{
+                                  position: 'absolute',
+                                  left: 0,
+                                  top: 0,
+                                  bottom: 0,
+                                  width: `${ratio}%`,
+                                  background: 'currentColor',
+                                  borderRadius: 999,
+                                }}
+                              />
                             </div>
 
-                            {item.gap > 0 && (
-                              <div className="muted" style={{ marginTop: 8, fontSize: 12 }}>
-                                Current gap: {item.gap} points · Category: {item.category}
-                              </div>
-                            )}
+                            <div
+                              style={{
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                gap: 10,
+                                marginTop: 7,
+                                fontSize: 11,
+                              }}
+                            >
+                              <span className="muted">
+                                {item.gap > 0 ? `${item.gap} point gap` : 'Requirement met'}
+                                {item.verified ? ' · Verified' : ''}
+                              </span>
+                              {isNext && <strong>Next step</strong>}
+                            </div>
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   ) : (
                     <Empty
-                      title="Your core foundation is complete"
-                      body="Explore the advanced skills in this role or select another career path to see a different roadmap."
+                      title="Core foundation is complete"
+                      body="Your current core requirements are met for this path. Explore advanced skills or another career path."
                     />
                   )}
                 </Card>
 
+                {strongSkills.length > 0 && (
+                  <Card>
+                    <div className="section-title">Skills you already have</div>
+                    <div
+                      style={{
+                        display: 'flex',
+                        flexWrap: 'wrap',
+                        gap: 8,
+                        marginTop: 12,
+                      }}
+                    >
+                      {strongSkills.slice(0, 10).map((item) => (
+                        <span
+                          key={`strong-${item.skill_id}`}
+                          className="chip"
+                          title={`${item.current}% current / ${item.required}% required`}
+                        >
+                          ✓ {item.skill}
+                        </span>
+                      ))}
+                    </div>
+                  </Card>
+                )}
+
                 <Card>
-                  <div className="section-title">How this roadmap changes for you</div>
-                  <div className="two-col" style={{ marginTop: 14 }}>
+                  <div className="section-title">What changes your roadmap?</div>
+                  <div className="two-col" style={{ marginTop: 12 }}>
                     <div>
-                      <strong>When you add a skill</strong>
-                      <p className="muted">
-                        The current level is recalculated and that skill can move
-                        from a learning step into your foundation.
+                      <strong>Add a skill</strong>
+                      <p className="muted" style={{ marginBottom: 0 }}>
+                        Your current levels are recalculated and completed requirements move out of the gap list.
                       </p>
                     </div>
                     <div>
-                      <strong>When you add evidence</strong>
-                      <p className="muted">
-                        Evidence-backed levels and verification can change your
-                        role alignment and reorder the next skills to build.
+                      <strong>Add evidence</strong>
+                      <p className="muted" style={{ marginBottom: 0 }}>
+                        Evidence and academic verification can change your skill levels and role alignment.
                       </p>
                     </div>
                   </div>

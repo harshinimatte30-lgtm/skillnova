@@ -20,6 +20,7 @@ Features:
 
 from datetime import datetime
 from typing import Any, Optional
+import json
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -1980,16 +1981,184 @@ def _resolve_assessment_stage(
     return stage_by_rank[resolved_rank]
 
 
+
+# ============================================================
+# AYUSH TOPIC INTELLIGENCE
+# ============================================================
+# Topic clusters are intentionally AYUSH-only. They reuse the existing
+# AYUSH technical question banks rather than introducing non-AYUSH questions.
+
+AYUSH_TOPIC_GROUPS = {
+    "AYUSH Foundations": [
+        "ayush systems overview", "traditional knowledge", "fundamental research",
+        "research methodology", "public health", "epidemiology", "literature review",
+        "evidence synthesis", "scientific writing", "research ethics", "health informatics",
+    ],
+    "Research & Evidence": [
+        "fundamental research", "research methodology", "clinical research",
+        "clinical data management", "data analysis", "statistics", "literature review",
+        "evidence synthesis", "scientific writing", "research ethics", "data management",
+        "biochemistry",
+    ],
+    "Clinical & Healthcare": [
+        "clinical research", "clinical data management", "pharmacology", "pharmacovigilance",
+        "epidemiology", "public health", "health informatics", "biochemistry", "microbiology",
+        "research methodology", "ayush systems overview",
+    ],
+    "Pharmaceutical & Product Development": [
+        "pharmacognosy", "medicinal plants", "pharmacology", "pharmacological research",
+        "drug development", "quality control", "standardization", "gmp", "regulatory compliance",
+        "microbiology", "biotechnology", "biochemistry",
+    ],
+    "Quality, Standardization & GMP": [
+        "quality control", "standardization", "gmp", "regulatory compliance", "pharmacognosy",
+        "medicinal plants", "microbiology", "biotechnology", "drug development", "pharmacology",
+        "pharmacological research",
+    ],
+    "Drug Safety & Regulatory": [
+        "pharmacovigilance", "regulatory compliance", "clinical research", "clinical data management",
+        "drug development", "quality control", "standardization", "gmp", "research ethics",
+        "public health", "epidemiology",
+    ],
+    "Medicinal Plants & Natural Products": [
+        "medicinal plants", "pharmacognosy", "pharmacology", "pharmacological research",
+        "drug development", "quality control", "standardization", "biochemistry", "microbiology",
+        "biotechnology", "traditional knowledge",
+    ],
+    "Digital Health & Data": [
+        "health informatics", "data analysis", "data management", "statistics", "clinical data management",
+        "epidemiology", "public health", "scientific writing", "research methodology", "clinical research",
+        "evidence synthesis",
+    ],
+    "Traditional Systems & Knowledge": [
+        "ayush systems overview", "ayurveda", "yoga", "naturopathy", "siddha", "unani",
+        "homoeopathy", "sowa-rigpa", "traditional knowledge", "literary research", "public health",
+        "research methodology",
+    ],
+    "Public Health & Community AYUSH": [
+        "public health", "epidemiology", "health informatics", "clinical research", "clinical data management",
+        "research methodology", "research ethics", "evidence synthesis", "scientific writing",
+        "ayush systems overview", "traditional knowledge",
+    ],
+}
+
+CAREER_DIRECTION_TO_TOPICS = {
+    "ayush research & evidence": ["Research & Evidence"],
+    "clinical / healthcare services": ["Clinical & Healthcare"],
+    "ayush pharmaceutical & product development": ["Pharmaceutical & Product Development"],
+    "quality control / quality assurance": ["Quality, Standardization & GMP"],
+    "drug standardization": ["Quality, Standardization & GMP"],
+    "pharmacovigilance / drug safety": ["Drug Safety & Regulatory"],
+    "medicinal plants / herbal products": ["Medicinal Plants & Natural Products"],
+    "ayush education / academia": ["Research & Evidence", "Traditional Systems & Knowledge"],
+    "public health / community ayush": ["Public Health & Community AYUSH"],
+    "regulatory / compliance": ["Drug Safety & Regulatory", "Quality, Standardization & GMP"],
+    "ayush digital health / informatics": ["Digital Health & Data"],
+    "industry / innovation": ["Pharmaceutical & Product Development", "Quality, Standardization & GMP"],
+    "entrepreneurship": ["Pharmaceutical & Product Development", "Public Health & Community AYUSH"],
+}
+
+
+def _profile_ayush_preferences(profile: Optional[Profile]) -> dict[str, list[str]]:
+    raw = str(getattr(profile, "career_interests", "") or "").strip()
+    if not raw:
+        return {"ayush_systems": [], "career_directions": [], "work_preferences": []}
+    try:
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            return {
+                "ayush_systems": [str(x).strip() for x in value.get("ayush_systems", []) if str(x).strip()],
+                "career_directions": [str(x).strip() for x in value.get("career_directions", []) if str(x).strip()],
+                "work_preferences": [str(x).strip() for x in value.get("work_preferences", []) if str(x).strip()],
+            }
+    except Exception:
+        pass
+    return {"ayush_systems": [], "career_directions": [], "work_preferences": []}
+
+
+def _recommended_topics(profile: Optional[Profile], role_name: str, required_skills: list[str]) -> list[str]:
+    prefs = _profile_ayush_preferences(profile)
+    scores = {topic: 0 for topic in AYUSH_TOPIC_GROUPS}
+    for direction in prefs["career_directions"]:
+        for topic in CAREER_DIRECTION_TO_TOPICS.get(direction.strip().lower(), []):
+            scores[topic] += 5
+    role_text = _normalise_skill_name(role_name)
+    for topic, banks in AYUSH_TOPIC_GROUPS.items():
+        scores[topic] += sum(2 for skill in required_skills if _normalise_skill_name(skill) in set(banks))
+        if any(token in role_text for token in _normalise_skill_name(topic).split() if len(token) > 4):
+            scores[topic] += 1
+    return sorted(scores, key=lambda name: (-scores[name], name))
+
+
+def _resolve_assessment_topic(
+    profile: Optional[Profile],
+    role_name: str,
+    required_skills: list[str],
+    requested_topic: Optional[str],
+) -> str:
+    requested = str(requested_topic or "").strip()
+    if requested:
+        if requested not in AYUSH_TOPIC_GROUPS:
+            raise HTTPException(status_code=400, detail="Invalid AYUSH assessment topic")
+        return requested
+    recommended = _recommended_topics(profile, role_name, required_skills)
+    return recommended[0] if recommended else next(iter(AYUSH_TOPIC_GROUPS))
+
+
+def _topic_question_pool(topic: str, stage: str, role_id: int) -> list[tuple[str, tuple]]:
+    import hashlib
+    pool = []
+    seen = set()
+    for bank_key in AYUSH_TOPIC_GROUPS.get(topic, []):
+        bank = TECHNICAL_BANK.get(bank_key)
+        if not bank:
+            continue
+        item = bank.get(stage)
+        if not item:
+            continue
+        signature = item[0]
+        if signature in seen:
+            continue
+        seen.add(signature)
+        pool.append((bank_key, item))
+    if pool:
+        seed = int(hashlib.sha1(f"{role_id}|{topic}|{stage}".encode()).hexdigest()[:8], 16)
+        offset = seed % len(pool)
+        pool = pool[offset:] + pool[:offset]
+    return pool
+
+
+def _select_topic_questions(topic: str, stages: list[str], count: int, role_id: int) -> list[tuple[str, tuple]]:
+    selected = []
+    used = set()
+    for index in range(count):
+        stage = stages[index % len(stages)]
+        for bank_key, item in _topic_question_pool(topic, stage, role_id):
+            if item[0] not in used:
+                selected.append((bank_key, item))
+                used.add(item[0])
+                break
+    return selected
+
+
+def _topic_from_category(category: Optional[str]) -> Optional[str]:
+    value = str(category or "")
+    marker = "|topic="
+    if marker not in value:
+        return None
+    return value.split(marker, 1)[1].split("|", 1)[0].strip() or None
+
 def _assessment_config_id(
     role_id: int,
     test_type: str,
     year: str,
     difficulty: str,
+    topic: str = "",
 ) -> str:
     """Create a stable ID for one role/year/type/difficulty combination."""
     import hashlib
 
-    raw = f"{role_id}|{test_type}|{year}|{difficulty}"
+    raw = f"{role_id}|{test_type}|{year}|{difficulty}|{topic}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
 
 
@@ -2196,19 +2365,9 @@ def ensure_assessment_for_role(
     test_type: str = "Role-specific",
     year: Optional[str] = None,
     difficulty: str = "Medium",
+    topic: Optional[str] = None,
 ) -> Optional[Assessment]:
-    """
-    Return/create the shared assessment container for a role.
-
-    A role has one Assessment row in the existing database schema, so different
-    quiz configurations are stored as separate question blocks inside that row.
-    Each block is tagged with a stable configuration ID:
-
-        role + profile year + test type + difficulty
-
-    Attempts are therefore independent even though the legacy schema has a
-    unique Assessment.role_id constraint.
-    """
+    """Return/create the shared assessment container for one AYUSH configuration."""
     from ..models import Role, RoleSkillRequirement
 
     role = db.query(Role).filter(Role.id == role_id).first()
@@ -2217,9 +2376,6 @@ def ensure_assessment_for_role(
 
     normalized_type = _normalise_test_type(test_type)
     normalized_difficulty = _normalise_difficulty(difficulty)
-
-    # IMPORTANT: the assessment year is never taken from the browser. The
-    # student's Profile is the single source of truth.
     profile_year = str(getattr(profile, "year_degree", "") or "").strip()
     if not profile_year:
         raise HTTPException(
@@ -2227,179 +2383,111 @@ def ensure_assessment_for_role(
             detail="Set your current year of study in My Profile before starting an assessment.",
         )
 
-    year_stage = _stage_from_year(profile_year, profile)
-    stages = _stage_sequence(year_stage, normalized_difficulty, 6)
-    config_id = _assessment_config_id(
-        role_id,
-        normalized_type,
-        profile_year,
-        normalized_difficulty,
-    )
-
-    assessment = (
-        db.query(Assessment)
-        .filter(Assessment.role_id == role_id)
-        .first()
-    )
-
-    if assessment is None:
-        assessment = Assessment(
-            role_id=role.id,
-            title=f"{role.name} Assessment",
-            description=(
-                "AYUSH assessment container. "
-                "Individual question sets are selected by role, profile year, "
-                "test type and difficulty."
-            ),
-        )
-        db.add(assessment)
-        db.flush()
-
-    # If this exact configuration already exists, never rebuild it. This keeps
-    # old submitted results stable and makes repeated opens deterministic.
-    existing_questions = _questions_for_config(db, assessment.id, config_id)
-    if existing_questions:
-        return assessment
-
-    title = f"{role.name} {normalized_type} Assessment"
-    description = (
-        f"{normalized_type} MCQ assessment for {role.name}. "
-        f"Academic year: {profile_year}. Difficulty: {normalized_difficulty}. "
-        "Correct answers are revealed only after submission. "
-        f"Configuration: {config_id}."
-    )
-
     requirements = (
         db.query(RoleSkillRequirement)
         .filter(RoleSkillRequirement.role_id == role.id)
         .order_by(RoleSkillRequirement.id.asc())
         .all()
     )
-
     technical_skills = []
     seen = set()
     for requirement in requirements:
-        skill_id = getattr(requirement, "skill_id", None)
-        if not skill_id:
-            continue
-        skill = db.query(Skill).filter(Skill.id == skill_id).first()
+        skill = db.query(Skill).filter(Skill.id == getattr(requirement, "skill_id", None)).first()
         if not skill:
             continue
         key = _normalise_skill_name(skill.name)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        technical_skills.append(skill)
-        if len(technical_skills) >= 6:
-            break
+        if key and key not in seen:
+            seen.add(key)
+            technical_skills.append(skill)
 
-    # Use a high order-index range for generated configuration blocks so they
-    # cannot disturb legacy questions already stored for this role.
+    required_skill_names = [str(skill.name) for skill in technical_skills]
+    selected_topic = (
+        _resolve_assessment_topic(profile, role.name, required_skill_names, topic)
+        if normalized_type == "Role-specific" else ""
+    )
+
+    year_stage = _stage_from_year(profile_year, profile)
+    stages = _stage_sequence(year_stage, normalized_difficulty, 10)
+    config_id = _assessment_config_id(
+        role_id, normalized_type, profile_year, normalized_difficulty, selected_topic
+    )
+
+    assessment = db.query(Assessment).filter(Assessment.role_id == role_id).first()
+    if assessment is None:
+        assessment = Assessment(
+            role_id=role.id,
+            title=f"{role.name} Assessment",
+            description="AYUSH assessment container with role, difficulty and competency-topic configurations.",
+        )
+        db.add(assessment)
+        db.flush()
+
+    if _questions_for_config(db, assessment.id, config_id):
+        return assessment
+
     base_order = 100000 + int(config_id[:6], 16) * 10
     order_index = base_order
     added = 0
 
     if normalized_type == "Role-specific":
-        # Role-specific questions are driven by the role's required skills and
-        # the year/difficulty stage sequence.
-        for index, skill in enumerate(technical_skills):
-            stage = stages[index % len(stages)]
-            item = (
-                _role_specific_question(
-                    role.name,
-                    skill.name,
-                    stage,
-                    index,
-                )
-                or _technical_question(skill.name, stage)
+        topic_questions = _select_topic_questions(selected_topic, stages, 10, role_id)
+        if len(topic_questions) < 10:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"The AYUSH topic '{selected_topic}' currently has only "
+                    f"{len(topic_questions)} unique questions for this configuration. "
+                    "Add more questions to that AYUSH topic before launching it."
+                ),
             )
-            if not item:
-                continue
-
+        for bank_key, item in topic_questions:
             question, a, b, c, d, correct, explanation = item
-            db.add(
-                AssessmentQuestion(
-                    assessment_id=assessment.id,
-                    skill_id=skill.id,
-                    category=f"{TECHNICAL}|cfg={config_id}",
-                    question=question,
-                    option_a=a,
-                    option_b=b,
-                    option_c=c,
-                    option_d=d,
-                    correct_option=correct,
-                    explanation=explanation,
-                    order_index=order_index,
-                )
-            )
+            skill = db.query(Skill).filter(Skill.name.ilike(bank_key)).first()
+            db.add(AssessmentQuestion(
+                assessment_id=assessment.id,
+                skill_id=skill.id if skill else None,
+                category=f"{TECHNICAL}|topic={selected_topic}|cfg={config_id}",
+                question=question,
+                option_a=a,
+                option_b=b,
+                option_c=c,
+                option_d=d,
+                correct_option=correct,
+                explanation=explanation,
+                order_index=order_index,
+            ))
             order_index += 1
             added += 1
-
     elif normalized_type == "Soft Skills":
-        for item in _select_questions_for_bank(
-            SOFT_SKILL_BANK,
-            stages[:3],
-            3,
-            role_id,
-        ):
+        for item in _select_questions_for_bank(SOFT_SKILL_BANK, stages[:3], 3, role_id):
             question, a, b, c, d, correct, explanation = item
-            db.add(
-                AssessmentQuestion(
-                    assessment_id=assessment.id,
-                    skill_id=None,
-                    category=f"{SOFT_SKILLS}|cfg={config_id}",
-                    question=question,
-                    option_a=a,
-                    option_b=b,
-                    option_c=c,
-                    option_d=d,
-                    correct_option=correct,
-                    explanation=explanation,
-                    order_index=order_index,
-                )
-            )
+            db.add(AssessmentQuestion(
+                assessment_id=assessment.id, skill_id=None,
+                category=f"{SOFT_SKILLS}|cfg={config_id}",
+                question=question, option_a=a, option_b=b, option_c=c, option_d=d,
+                correct_option=correct, explanation=explanation, order_index=order_index,
+            ))
             order_index += 1
             added += 1
-
-    else:  # Aptitude
-        for item in _select_questions_for_bank(
-            APTITUDE_BANK,
-            stages[:3],
-            3,
-            role_id,
-        ):
+    else:
+        for item in _select_questions_for_bank(APTITUDE_BANK, stages[:3], 3, role_id):
             question, a, b, c, d, correct, explanation = item
-            db.add(
-                AssessmentQuestion(
-                    assessment_id=assessment.id,
-                    skill_id=None,
-                    category=f"{APTITUDE}|cfg={config_id}",
-                    question=question,
-                    option_a=a,
-                    option_b=b,
-                    option_c=c,
-                    option_d=d,
-                    correct_option=correct,
-                    explanation=explanation,
-                    order_index=order_index,
-                )
-            )
+            db.add(AssessmentQuestion(
+                assessment_id=assessment.id, skill_id=None,
+                category=f"{APTITUDE}|cfg={config_id}",
+                question=question, option_a=a, option_b=b, option_c=c, option_d=d,
+                correct_option=correct, explanation=explanation, order_index=order_index,
+            ))
             order_index += 1
             added += 1
 
     db.flush()
-
     if added == 0:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No {normalized_type.lower()} questions are available for this role yet.",
-        )
-
-    # Keep the shared container description generic; the actual configuration
-    # is carried by the question block and returned by start_assessment.
+        raise HTTPException(status_code=404, detail=f"No {normalized_type.lower()} questions are available for this role yet.")
     db.commit()
     db.refresh(assessment)
     return assessment
+
 
 def get_assessment_for_role(
     db: Session,
@@ -2408,6 +2496,7 @@ def get_assessment_for_role(
     test_type: str = "Role-specific",
     year: Optional[str] = None,
     difficulty: str = "Medium",
+    topic: Optional[str] = None,
 ) -> Optional[Assessment]:
     """Return/create the role assessment using the requested quiz settings."""
     return ensure_assessment_for_role(
@@ -2417,6 +2506,7 @@ def get_assessment_for_role(
         test_type=test_type,
         year=year,
         difficulty=difficulty,
+        topic=topic,
     )
 
 def get_question_list(
@@ -2482,6 +2572,7 @@ def question_for_student(
         "id": question.id,
         "skill_id": question.skill_id,
         "category": _clean_question_category(question.category),
+        "topic": _topic_from_category(question.category),
         "question": question.question,
         "options": {
             "A": question.option_a,
@@ -2515,6 +2606,7 @@ def question_result(
         "question_id": question.id,
         "skill_id": question.skill_id,
         "category": _clean_question_category(question.category),
+        "topic": _topic_from_category(question.category),
         "question": question.question,
         "options": {
             "A": question.option_a,
@@ -2661,6 +2753,47 @@ def update_student_skill_from_result(
 
 
 # ============================================================
+# AYUSH ASSESSMENT TOPICS
+# ============================================================
+
+@router.get("/{role_id}/topics")
+def assessment_topics(
+    role_id: int,
+    user: User = Depends(require_student),
+    db: Session = Depends(get_db),
+):
+    profile = get_student_profile(db, user)
+    from ..models import Role, RoleSkillRequirement
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    required = (
+        db.query(Skill)
+        .join(RoleSkillRequirement, RoleSkillRequirement.skill_id == Skill.id)
+        .filter(RoleSkillRequirement.role_id == role_id)
+        .all()
+    )
+    names = [str(skill.name) for skill in required]
+    recommended = _recommended_topics(profile, role.name, names)
+    result = []
+    for rank, topic_name in enumerate(recommended):
+        # Count unique bank entries across the three academic stages.
+        available = len({
+            item[1][0]
+            for stage in (FOUNDATION, APPLIED, ADVANCED)
+            for item in _topic_question_pool(topic_name, stage, role_id)
+        })
+        result.append({
+            "name": topic_name,
+            "description": f"AYUSH competency assessment covering {topic_name.lower()}.",
+            "recommended": rank < 3,
+            "available_questions": available,
+            "ready": available >= 10,
+        })
+    return {"role_id": role_id, "topics": result}
+
+
+# ============================================================
 # CREATE ATTEMPT
 # ============================================================
 
@@ -2671,6 +2804,7 @@ def start_assessment(
     role_id: int,
     test_type: str = Query("Role-specific"),
     difficulty: str = Query("Medium"),
+    topic: Optional[str] = Query(None),
     year: Optional[str] = Query(None),
     user: User = Depends(require_student),
     db: Session = Depends(get_db),
@@ -2705,11 +2839,23 @@ def start_assessment(
 
     normalized_type = _normalise_test_type(test_type)
     normalized_difficulty = _normalise_difficulty(difficulty)
+
+    from ..models import Role, RoleSkillRequirement
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    required = (
+        db.query(Skill)
+        .join(RoleSkillRequirement, RoleSkillRequirement.skill_id == Skill.id)
+        .filter(RoleSkillRequirement.role_id == role_id)
+        .all()
+    )
+    resolved_topic = (
+        _resolve_assessment_topic(profile, role.name, [str(x.name) for x in required], topic)
+        if normalized_type == "Role-specific" else ""
+    )
     config_id = _assessment_config_id(
-        role_id,
-        normalized_type,
-        profile_year,
-        normalized_difficulty,
+        role_id, normalized_type, profile_year, normalized_difficulty, resolved_topic
     )
 
     assessment = get_assessment_for_role(
@@ -2719,6 +2865,7 @@ def start_assessment(
         test_type=normalized_type,
         year=profile_year,
         difficulty=normalized_difficulty,
+        topic=resolved_topic,
     )
 
     if not assessment:
@@ -2775,6 +2922,7 @@ def start_assessment(
             ),
             "test_type": normalized_type,
             "difficulty": normalized_difficulty,
+            "topic": resolved_topic or None,
             "year": profile_year,
             "total_questions": len(questions),
             "questions": [question_for_student(q) for q in questions],
@@ -2808,6 +2956,7 @@ def start_assessment(
         ),
         "test_type": normalized_type,
         "difficulty": normalized_difficulty,
+        "topic": resolved_topic or None,
         "year": profile_year,
         "total_questions": len(questions),
         "questions": [question_for_student(q) for q in questions],
@@ -3221,6 +3370,7 @@ def assessment_status(
     role_id: int,
     test_type: str = Query("Role-specific"),
     difficulty: str = Query("Medium"),
+    topic: Optional[str] = Query(None),
     user: User = Depends(require_student),
     db: Session = Depends(get_db),
 ):
@@ -3241,11 +3391,22 @@ def assessment_status(
 
     normalized_type = _normalise_test_type(test_type)
     normalized_difficulty = _normalise_difficulty(difficulty)
+    from ..models import Role, RoleSkillRequirement
+    role = db.query(Role).filter(Role.id == role_id).first()
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    required = (
+        db.query(Skill)
+        .join(RoleSkillRequirement, RoleSkillRequirement.skill_id == Skill.id)
+        .filter(RoleSkillRequirement.role_id == role_id)
+        .all()
+    )
+    resolved_topic = (
+        _resolve_assessment_topic(profile, role.name, [str(x.name) for x in required], topic)
+        if normalized_type == "Role-specific" else ""
+    )
     config_id = _assessment_config_id(
-        role_id,
-        normalized_type,
-        profile_year,
-        normalized_difficulty,
+        role_id, normalized_type, profile_year, normalized_difficulty, resolved_topic
     )
 
     assessment = get_assessment_for_role(
@@ -3255,6 +3416,7 @@ def assessment_status(
         test_type=normalized_type,
         year=profile_year,
         difficulty=normalized_difficulty,
+        topic=resolved_topic,
     )
 
     if not assessment:
@@ -3267,6 +3429,7 @@ def assessment_status(
         db,
         user.id,
         assessment.id,
+        configuration_key=config_id,
     )
 
     if not attempt:
